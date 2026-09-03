@@ -141,3 +141,14 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# build output (published via prepublishOnly, not committed)
+dist/
+
+# browser-inspector runtime / secrets
+.env
+.session-key
+**/.cdp-port
+tmp/
+canonical/machine.local.json
+canonical/sessions/
