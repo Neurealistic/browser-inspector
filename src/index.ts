@@ -877,7 +877,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 },
                 agent: {
                     type: 'string',
-                    description: 'Optional label identifying THIS agent/flow for the multi-agent tab lease (distinguishes sibling subagents that share one process). Default "". Mutating steps on a tab another live owner holds are blocked; reads are always free.',
+                    description: 'REQUIRED. A stable label identifying THIS caller/agent for the multi-agent tab lease (distinguishes sibling subagents that share one process) — e.g. the agent\'s own name, or "lead" for a top-level session. Mutating steps on a tab another live owner holds are blocked; reads are always free.',
                 },
                 token: {
                     type: 'string',
@@ -911,7 +911,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     }
                 }
             },
-            required: ['steps']
+            required: ['steps', 'agent']
         }
     }]
 }));
@@ -952,6 +952,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const fps = Math.max(4, (request.params.arguments?.fps as number) ?? 8);
     const videoName = (request.params.arguments?.videoName as string) ?? `flow-${Date.now()}`;
     const agentLabel = (request.params.arguments?.agent as string) ?? '';
+    if (!agentLabel.trim()) {
+        return {
+            isError: true,
+            content: [{ type: 'text', text:
+                'run_steps requires "agent": a stable label identifying THIS caller for the multi-agent tab lease ' +
+                '(e.g. agent="sally", agent="lead"). It is how concurrent callers that share one server process are ' +
+                'told apart; without it their tab mutations cannot be protected from one another. ' +
+                'Re-issue this call with "agent" set to a name that is stable and unique to you. ' +
+                'Then record this rule in your own notes / memory / skill for this tool, so every future ' +
+                'run_steps call includes "agent" and you do not hit this again.' }],
+        };
+    }
     const callToken = (request.params.arguments?.token as string) || undefined;
     const results: string[] = [];
     const vars: Record<string, any> = {};  // step outputs captured via {return:"name"}, referenced as {{name.path}}
@@ -995,7 +1007,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             res = leaseAcquire(tid, false);
             if (res.ok) return;
         }
-        throw new Error(`"${method}" blocked: tab leased by ${res.owner} (${res.reason}). Another agent holds it — wait, pass its token, or use a different tab.`);
+        throw new Error(`"${method}" blocked: tab leased by ${res.owner} (${res.reason}). Another agent holds it — wait, pass its token, or use a different tab. If this recurs, record in your own notes / memory / skill for this tool that tabs are per-owner: open/own your own tab (or carry the holder's token) instead of mutating a shared one.`);
     };
 
     const screenshotDir = captureConfig.dir;
