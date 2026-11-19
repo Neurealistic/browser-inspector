@@ -16,6 +16,7 @@ import { readFileSync, mkdirSync, readdirSync, statSync, unlinkSync, renameSync,
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { pathToFileURL } from 'node:url';
+import { SqliteLeaseStore, type LeaseClient, type AcquireResult } from './lease.js';
 
 // ─── Capture storage ─────────────────────────────────────────────────────────
 
@@ -319,6 +320,44 @@ async function getPage(profileName = 'admin', selector?: number | string): Promi
     );
     (page as any)._profileName = profileName;
     return page;
+}
+
+// ─── Multi-agent lease ─────────────────────────────────────────────────────────
+// Phase 1: in-process, SQLite-backed (swappable behind LeaseClient — see lease.ts). A MUTATE on a
+// tab another live owner holds is denied (fail-closed); READS are free (they don't collide). The
+// chokepoint lives in the run_steps step loop below.
+const lease: LeaseClient = new SqliteLeaseStore();
+
+// Playwright's Page has no public targetId. Resolve it once via a throwaway CDP session and cache it
+// on the Page (Playwright reuses one Page object per tab over connectOverCDP, so the cache sticks).
+async function pageTargetId(page: Page): Promise<string> {
+    const cached = (page as any)._targetId;
+    if (cached) return cached;
+    const sess = await page.context().newCDPSession(page);
+    try {
+        const info: any = await sess.send('Target.getTargetInfo');
+        const id = info?.targetInfo?.targetId;
+        (page as any)._targetId = id;
+        return id;
+    } finally { try { await sess.detach(); } catch {} }
+}
+
+// Reads don't collide, so they never take a lease. Everything not provably a read is treated as a
+// mutate (fail-closed): navigate/reload/click/fill/type/press/selectOption/clearSession, every POM
+// call ("module:Class.method"), and the generic pw passthrough. Residual gap (accepted, cooperative
+// — the lease stops honest agents stomping each other, it is not a security boundary): page.evaluate
+// / pw.evaluate run arbitrary JS and are classed as reads (their documented use is DOM extraction),
+// so an evaluate that mutates is not gated.
+const READ_METHODS = new Set([
+    'page.url', 'page.title', 'page.evaluate', 'page.screenshot',
+    'page.startCapture', 'page.getCapture', 'page.clearCapture',
+    'page.waitForNetworkResponse', 'page.waitForWebSocket',
+    'pw.getText', 'pw.getAttribute', 'pw.isVisible', 'pw.count', 'pw.evaluate', 'pw.waitFor',
+]);
+function isMutating(method: string): boolean {
+    if (method.startsWith('browser.') || method.startsWith('api_user.')) return false;
+    if (method === 'page.select' || method === 'screencast.switch') return false;
+    return !READ_METHODS.has(method);
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -773,6 +812,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             '  — browser.close <profile>: close a profile',
             '  — browser.pages <profile>: list open pages in a profile',
             '',
+            'Multi-agent tab lease (so concurrent agents/sessions do not stomp each other — every profile',
+            'CDP port is shared, so any MCP process can drive any tab). MUTATES (navigate/click/fill/type/',
+            'press/select/reload/clearSession + any POM call + pw passthrough) take a per-tab lease; READS',
+            '(url/title/evaluate/getText/count/… ) are free. A mutate on a tab another LIVE owner holds is',
+            'blocked. Pass "agent" (a label for this flow — distinguishes sibling subagents in one process)',
+            'and, to keep a tab across calls, "token" (from a previous call\'s 🔒 output or browser.acquire):',
+            '  — browser.acquire [<index|URL-substring>]: claim a tab up front; returns its lease token (hold across calls)',
+            '  — browser.release [<index|URL-substring>]: drop a lease you hold',
+            '  — browser.leases: list current leases (● live owner / ○ dead → reclaimable)',
+            '  Leases auto-release at the end of the call unless acquired via browser.acquire or carried in via token;',
+            '  a lease is reclaimable the instant its owner process dies or its tab closes (not on a mere TTL).',
+            '',
             'Multi-tab (CDP drives ANY tab — it does NOT need to be foregrounded):',
             '  — page.select <index|URL-substring>: switch the ACTIVE tab for all subsequent steps (sticky)',
             '  — per-step "onPage": <index|URL-substring> runs just that one step on a specific tab',
@@ -823,6 +874,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 fps: {
                     type: 'number',
                     description: 'Output frames-per-second for screencast video (default 8, floored at 4). Screencast frames are event-driven; ffmpeg resamples to this constant fps for smooth playback.',
+                },
+                agent: {
+                    type: 'string',
+                    description: 'Optional label identifying THIS agent/flow for the multi-agent tab lease (distinguishes sibling subagents that share one process). Default "". Mutating steps on a tab another live owner holds are blocked; reads are always free.',
+                },
+                token: {
+                    type: 'string',
+                    description: 'Lease capability token from a previous call\'s 🔒 output (or a browser.acquire step). Pass it to keep holding a tab you mutated across separate run_steps calls; omit for one-shot flows (implicit leases auto-release at the end of the call).',
                 },
                 steps: {
                     type: 'array',
@@ -892,8 +951,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const screencast = (request.params.arguments?.screencast as boolean) ?? false;
     const fps = Math.max(4, (request.params.arguments?.fps as number) ?? 8);
     const videoName = (request.params.arguments?.videoName as string) ?? `flow-${Date.now()}`;
+    const agentLabel = (request.params.arguments?.agent as string) ?? '';
+    const callToken = (request.params.arguments?.token as string) || undefined;
     const results: string[] = [];
     const vars: Record<string, any> = {};  // step outputs captured via {return:"name"}, referenced as {{name.path}}
+
+    // Per-call lease bookkeeping. heldTokens: targetId -> capability token we currently hold.
+    // freshThisCall: tabs this call minted a NEW token for (auto-released at the end unless held
+    // explicitly). explicitHold: tabs claimed via browser.acquire (kept across calls).
+    const heldTokens = new Map<string, string>();
+    const freshThisCall = new Set<string>();
+    const explicitHold = new Set<string>();
+    // Acquire (or re-authorize) a lease for `tid`; records the token + whether it was freshly minted.
+    const leaseAcquire = (tid: string, explicit: boolean): AcquireResult => {
+        const incoming = heldTokens.get(tid) ?? callToken;
+        const res = lease.acquire(tid, profileName, agentLabel, incoming);
+        if (res.ok) {
+            heldTokens.set(tid, res.token!);
+            if (res.token !== incoming) freshThisCall.add(tid);
+            if (explicit) explicitHold.add(tid);
+        }
+        return res;
+    };
+    // Live CDP targets for this profile — the tab-existence ground truth (only this process knows the port).
+    const liveTargetIds = async (): Promise<Set<string>> => {
+        const prof = BROWSER_PROFILES[effectiveProfile(profileName)];
+        if (!prof) return new Set();
+        try {
+            const r = await fetch(`http://localhost:${prof.cdpPort}/json`, { signal: AbortSignal.timeout(1500) });
+            const arr = await r.json() as any[];
+            return new Set(arr.map(t => t.id).filter(Boolean));
+        } catch { return new Set(); }
+    };
+    // Fail-closed gate for a mutate step: acquire the tab's lease, or (if the holder's tab is actually
+    // gone) reclaim via ground truth and retry, else throw — the loop turns a throw into a ✗ + break.
+    const ensureMutable = async (page: Page, method: string): Promise<void> => {
+        const tid = await pageTargetId(page);
+        let res = leaseAcquire(tid, false);
+        if (res.ok) return;
+        const live = await liveTargetIds();
+        if (!live.has(tid)) {            // stale lease: owner process alive but its tab is closed
+            lease.adminRelease(tid);
+            res = leaseAcquire(tid, false);
+            if (res.ok) return;
+        }
+        throw new Error(`"${method}" blocked: tab leased by ${res.owner} (${res.reason}). Another agent holds it — wait, pass its token, or use a different tab.`);
+    };
 
     const screenshotDir = captureConfig.dir;
     ensureCaptureDir();
@@ -955,7 +1058,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
             const param = interpolate(step.param, vars);
             let result: any;
-            if (step.method.startsWith('browser.') || step.method.startsWith('api_user.')) {
+            if (step.method === 'browser.leases') {
+                const rows = lease.list();
+                result = rows.length
+                    ? rows.map(l => `${l.live ? '●' : '○'} ${l.targetId.slice(0, 12)}… ${l.profile} ${l.owner}${l.live ? '' : ' (dead → reclaimable)'}`).join('\n')
+                    : 'no active leases';
+            } else if (step.method === 'browser.acquire') {
+                const sel = (typeof param === 'string' && /^\d+$/.test(param)) ? Number(param) : (param ?? activeSel);
+                const page = await getPage(profileName, sel);
+                const tid = await pageTargetId(page);
+                let res = leaseAcquire(tid, true);
+                if (!res.ok) {
+                    const live = await liveTargetIds();
+                    if (!live.has(tid)) { lease.adminRelease(tid); res = leaseAcquire(tid, true); }
+                }
+                result = res.ok
+                    ? `acquired ${tid.slice(0, 12)}… token=${heldTokens.get(tid)}`
+                    : `DENIED ${tid.slice(0, 12)}… — held by ${res.owner} (${res.reason})`;
+                if (!res.ok) throw new Error(result);
+            } else if (step.method === 'browser.release') {
+                const sel = (typeof param === 'string' && /^\d+$/.test(param)) ? Number(param) : (param ?? activeSel);
+                const page = await getPage(profileName, sel);
+                const tid = await pageTargetId(page);
+                const ok = lease.release(tid, agentLabel, heldTokens.get(tid) ?? callToken);
+                if (ok) { heldTokens.delete(tid); freshThisCall.delete(tid); explicitHold.delete(tid); }
+                result = ok ? `released ${tid.slice(0, 12)}…` : `not the holder of ${tid.slice(0, 12)}…`;
+            } else if (step.method.startsWith('browser.') || step.method.startsWith('api_user.')) {
                 result = await dispatch(null as any, step.method, param);
             } else if (step.method === 'page.select' && !recPage && !screencast) {
                 // Switch the active tab for subsequent steps (sticky). param = index | URL-substring.
@@ -983,6 +1111,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 if (recPage) p = recPage;
                 else if (screencast) { if (!p) p = await getPage(profileName); }
                 else p = await getPage(profileName, sel);
+                // recordVideo runs in an isolated launched context (no shared target) → no lease needed.
+                if (!recPage && isMutating(step.method)) await ensureMutable(p, step.method);
                 result = await dispatch(p, step.method, param);
                 // Update active page if navigate opened/changed it (CDP only; record page persists)
                 if (step.method === 'page.navigate' && !recPage && !screencast) {
@@ -1009,6 +1139,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             results.push(`[${ts}] ✗ ${step.method}: ${err.message}`);
             break;
         }
+    }
+
+    // Release leases this call minted implicitly; keep ones acquired via browser.acquire or carried in
+    // via token, so a multi-call flow can hold a tab (surfaced below with the token to reuse next call).
+    for (const tid of freshThisCall) {
+        if (explicitHold.has(tid)) continue;
+        try { lease.release(tid, agentLabel, heldTokens.get(tid)); } catch {}
+        heldTokens.delete(tid);
+    }
+    if (heldTokens.size) {
+        const tok = [...heldTokens.values()][0]; // per-owner token: identical for every tab this owner holds
+        results.push(`🔒 held by ${lease.ownerFor(agentLabel)} — pass token=${tok} on the next call to keep driving ALL these tabs:\n` +
+            [...heldTokens.keys()].map(tid => `  ${tid.slice(0, 12)}…`).join('\n'));
     }
 
     if (recordVideo && recCtx) {
