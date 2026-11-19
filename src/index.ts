@@ -519,8 +519,19 @@ const steps: Record<string, Record<string, StepFn>> = {
 type BrowserFn = (param?: any) => Promise<string>;
 
 const browserRegistry: Record<string, BrowserFn> = {
-    // Full status: all profiles, contexts, pages with current URLs
-    status: async () => {
+    // Full status: all profiles, contexts, pages with current URLs + each tab's lease owner.
+    // A tab's lease (if any) is joined by its CDP targetId; `viewerOwner` (the caller's own
+    // `${pid}:${label}`, threaded in from the run_steps `agent` arg) tags the caller's own tabs
+    // as "you" so an agent can read ownership straight from status — no second verb, no DB peek.
+    status: async (opts?: { viewerOwner?: string }) => {
+        const viewerOwner = opts?.viewerOwner;
+        const leaseByTarget = new Map(lease.list().map(l => [l.targetId, l] as const));
+        const ownerTag = (tid: string): string => {
+            const l = leaseByTarget.get(tid);
+            if (!l) return '○ free';
+            if (!l.live) return `○ ${l.owner} (dead → reclaimable)`;
+            return l.owner === viewerOwner ? `● you (${l.owner})` : `● ${l.owner} (held by another)`;
+        };
         const lines: string[] = [];
         for (const [name, profile] of Object.entries(BROWSER_PROFILES)) {
             const cdpUrl = `http://localhost:${profile.cdpPort}`;
@@ -539,7 +550,9 @@ const browserRegistry: Record<string, BrowserFn> = {
                     for (let ti = 0; ti < pages.length; ti++) {
                         const url = pages[ti].url();
                         const title = await pages[ti].title().catch(() => '');
-                        lines.push(`     Tab ${ti + 1}: ${url}${title ? ` — "${title}"` : ''}`);
+                        const tid = await pageTargetId(pages[ti]).catch(() => '');
+                        const tag = tid ? `  ${ownerTag(tid)}` : '';
+                        lines.push(`     Tab ${ti + 1}: ${url}${title ? ` — "${title}"` : ''}${tag}`);
                     }
                 }
             } catch {
@@ -807,7 +820,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             '',
             'Browser management (no page needed):',
             `  browser: ${Object.keys(browserRegistry).join(', ')}`,
-            '  — browser.status: check all profiles (running/stopped, page count)',
+            '  — browser.status: all profiles (running/stopped, tabs) + each tab\'s lease owner (● you / ● other owner / ○ free)',
             '  — browser.open <profile>: launch a profile with CDP',
             '  — browser.close <profile>: close a profile',
             '  — browser.pages <profile>: list open pages in a profile',
@@ -1075,6 +1088,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 result = rows.length
                     ? rows.map(l => `${l.live ? '●' : '○'} ${l.targetId.slice(0, 12)}… ${l.profile} ${l.owner}${l.live ? '' : ' (dead → reclaimable)'}`).join('\n')
                     : 'no active leases';
+            } else if (step.method === 'browser.status') {
+                // Special-cased here (not via the generic browser.* dispatch) so the caller's own
+                // owner is in scope — status joins each tab to its lease and tags the caller's as "you".
+                result = await browserRegistry.status({ viewerOwner: lease.ownerFor(agentLabel) });
             } else if (step.method === 'browser.acquire') {
                 const sel = (typeof param === 'string' && /^\d+$/.test(param)) ? Number(param) : (param ?? activeSel);
                 const page = await getPage(profileName, sel);
