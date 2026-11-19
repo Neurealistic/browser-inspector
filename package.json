@@ -1,6 +1,6 @@
 {
   "name": "@neurealistic/browser-inspector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server that drives a real Chromium over CDP for UI/DOM/network inspection, batched page-object steps, screenshot/video capture, and authed API calls — with an optional portable canonical profile store.",
   "type": "module",
   "bin": {
